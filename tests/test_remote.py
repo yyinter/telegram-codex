@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 import unittest
 
 
@@ -7,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from telegram_codex_remote import (  # noqa: E402
+    BridgeError,
+    RemoteCodexJob,
     RemoteCodexRunner,
     build_user_input,
     format_recent_threads_summary,
@@ -17,6 +21,31 @@ from telegram_codex_remote import (  # noqa: E402
 
 
 class RemoteBridgeTests(unittest.TestCase):
+    def make_runner(self, data=None):
+        runner = RemoteCodexRunner.__new__(RemoteCodexRunner)
+
+        class State:
+            def __init__(self, initial):
+                self.data = initial or {}
+                self.saved = 0
+
+            def save(self):
+                self.saved += 1
+
+        runner.state = State(data)
+        runner.config = SimpleNamespace(
+            workdir=ROOT,
+            approval_policy="on-request",
+            sandbox="workspace-write",
+            model=None,
+            model_provider=None,
+        )
+        runner.state_lock = threading.RLock()
+        runner.active_slot = runner.state.data.get("active_slot", "default")
+        runner.thread_id = RemoteCodexRunner._slot_thread_id(runner, runner.active_slot)
+        runner.force_new_next = False
+        return runner
+
     def test_build_user_input_text_and_images(self):
         items = build_user_input("hello", [ROOT / "a.png", ROOT / "b.jpg"])
         self.assertEqual({"type": "text", "text": "hello", "text_elements": []}, items[0])
@@ -54,18 +83,115 @@ class RemoteBridgeTests(unittest.TestCase):
         self.assertEqual("review.pr-1", normalize_slot("review.pr-1"))
 
     def test_slot_thread_storage(self):
-        runner = RemoteCodexRunner.__new__(RemoteCodexRunner)
-
-        class State:
-            data = {}
-
-            def save(self):
-                pass
-
-        runner.state = State()
+        runner = self.make_runner()
         self.assertIsNone(RemoteCodexRunner._slot_thread_id(runner, "default"))
         RemoteCodexRunner._set_slot_thread_id(runner, "debug", "thread-1")
         self.assertEqual("thread-1", RemoteCodexRunner._slot_thread_id(runner, "debug"))
+
+    def test_job_snapshot_captures_slot_thread_and_consumes_new_flag(self):
+        runner = self.make_runner(
+            {
+                "active_slot": "debug",
+                "session_slots": {"debug": "thread-1"},
+                "session_slot_cwds": {"debug": str(ROOT / "project")},
+            }
+        )
+        runner.force_new_next = True
+
+        job = runner.build_job_snapshot(123, 456, "hello", [ROOT / "a.png"])
+
+        self.assertEqual("debug", job.slot)
+        self.assertEqual("thread-1", job.thread_id)
+        self.assertEqual((ROOT / "project").resolve(), job.cwd)
+        self.assertTrue(job.force_new)
+        self.assertFalse(runner.force_new_next)
+
+    def test_ensure_thread_uses_job_snapshot_after_active_slot_changes(self):
+        runner = self.make_runner(
+            {
+                "active_slot": "new",
+                "session_slots": {"old": "old-thread", "new": "new-thread"},
+                "session_slot_cwds": {"old": str(ROOT / "old"), "new": str(ROOT / "new")},
+            }
+        )
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, params, timeout=90):
+                self.calls.append((method, params))
+                return {"thread": {"id": "old-thread"}}
+
+        client = Client()
+        runner.client = client
+        job = RemoteCodexJob(
+            chat_id=1,
+            message_id=2,
+            slot="old",
+            thread_id="old-thread",
+            cwd=(ROOT / "old").resolve(),
+            prompt="hello",
+        )
+
+        thread_id = runner.ensure_thread(job)
+
+        self.assertEqual("old-thread", thread_id)
+        self.assertEqual(("thread/resume", runner._thread_resume_params("old-thread", (ROOT / "old").resolve())), client.calls[0])
+        self.assertEqual("new", runner.active_slot)
+        self.assertEqual("old-thread", runner._slot_thread_id("old"))
+
+    def test_ensure_thread_resume_failure_does_not_start_new_thread(self):
+        runner = self.make_runner()
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, params, timeout=90):
+                self.calls.append(method)
+                raise BridgeError("missing")
+
+        runner.client = Client()
+        job = RemoteCodexJob(
+            chat_id=1,
+            message_id=2,
+            slot="debug",
+            thread_id="missing-thread",
+            cwd=ROOT,
+            prompt="hello",
+        )
+
+        with self.assertRaises(BridgeError):
+            runner.ensure_thread(job)
+
+        self.assertEqual(["thread/resume"], runner.client.calls)
+
+    def test_bind_thread_validates_and_saves_thread_cwd(self):
+        runner = self.make_runner({"active_slot": "default"})
+
+        class Client:
+            def request(self, method, params, timeout=90):
+                return {
+                    "data": [
+                        {
+                            "id": "thread-2",
+                            "source": "cli",
+                            "status": {"type": "notLoaded"},
+                            "cwd": str(ROOT / "other"),
+                            "preview": "other project",
+                        }
+                    ]
+                }
+
+        runner.client = Client()
+
+        slot = runner.bind_thread("thread-2", "other")
+
+        self.assertEqual("other", slot)
+        self.assertEqual("thread-2", runner._slot_thread_id("other"))
+        self.assertEqual((ROOT / "other").resolve(), runner._slot_cwd("other"))
+        self.assertEqual("other", runner.active_slot)
 
     def test_recent_threads_lists_all_threads_by_default(self):
         runner = RemoteCodexRunner.__new__(RemoteCodexRunner)

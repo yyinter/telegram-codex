@@ -169,6 +169,10 @@ The state looks conceptually like this:
   "session_slots": {
     "default": "019e1cf7-...",
     "debug-fa": "019e1d02-..."
+  },
+  "session_slot_cwds": {
+    "default": "/path/to/project",
+    "debug-fa": "/path/to/other/project"
   }
 }
 ```
@@ -188,7 +192,9 @@ including their `cwd`. Use `/sessions here` to filter to the bridge's current
 ```
 
 Creates or switches to slot `debug-fa`; the next prompt starts a fresh Codex
-thread and stores that thread id in the slot.
+thread and stores that thread id in the slot. If the slot was already bound to
+a directory, the fresh thread uses that slot directory; otherwise it uses
+`CODEX_WORKDIR`.
 
 ```text
 /use debug-fa
@@ -203,6 +209,12 @@ Codex thread via `thread/resume` + `turn/start`.
 
 Binds an existing Codex thread id to a Telegram slot. Use this when you started
 a Codex conversation elsewhere and want Telegram to continue that exact session.
+The bridge validates the id against the shared app-server's thread list and
+stores that thread's `cwd` with the slot.
+
+Prompts are bound to the slot, thread id, and `cwd` that were active when the
+Telegram message was accepted. Switching slots while a message is queued will
+not move that queued prompt to another session.
 
 ## Security Notes
 

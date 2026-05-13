@@ -168,6 +168,9 @@ class RemoteBridgeConfig:
 class RemoteCodexJob:
     chat_id: int
     message_id: int
+    slot: str
+    thread_id: str | None
+    cwd: Path
     prompt: str
     image_paths: list[Path] = field(default_factory=list)
     force_new: bool = False
@@ -556,7 +559,9 @@ class RemoteCodexRunner:
         self.thread_id: str | None = self._slot_thread_id(self.active_slot)
         self.force_new_next = False
         self.active_turn_id: str | None = None
+        self.active_thread_id: str | None = None
         self.active_chat_id: int | None = None
+        self.state_lock = threading.RLock()
         self.pending_approvals: dict[int, PendingApproval] = {}
         self.pending_lock = threading.Lock()
         self.next_approval_id = 1
@@ -568,31 +573,72 @@ class RemoteCodexRunner:
         self.jobs.put(job)
         return pending + 1
 
+    def build_job_snapshot(
+        self,
+        chat_id: int,
+        message_id: int,
+        prompt: str,
+        image_paths: list[Path],
+    ) -> RemoteCodexJob:
+        with self.state_lock:
+            slot = self.active_slot
+            job = RemoteCodexJob(
+                chat_id=chat_id,
+                message_id=message_id,
+                slot=slot,
+                thread_id=self._slot_thread_id(slot),
+                cwd=self._slot_cwd(slot),
+                prompt=prompt,
+                image_paths=image_paths,
+                force_new=self.force_new_next,
+            )
+            self.force_new_next = False
+            self.state.save()
+            return job
+
     def start_new_next(self, slot: str | None = None) -> str:
-        if slot:
-            self.set_active_slot(slot)
-        self.thread_id = None
-        self.force_new_next = True
-        self._set_slot_thread_id(self.active_slot, None)
-        self.state.save()
-        return self.active_slot
+        with self.state_lock:
+            if slot:
+                self._set_active_slot_locked(normalize_slot(slot))
+            self.thread_id = None
+            self.force_new_next = True
+            self._set_slot_thread_id(self.active_slot, None)
+            self._set_slot_cwd(self.active_slot, self._slot_cwd(self.active_slot))
+            self.state.save()
+            return self.active_slot
 
     def set_active_slot(self, slot: str) -> None:
-        slot = normalize_slot(slot)
+        with self.state_lock:
+            self._set_active_slot_locked(normalize_slot(slot))
+            self.force_new_next = False
+            self.state.save()
+
+    def resume_active_next(self) -> str:
+        with self.state_lock:
+            self.force_new_next = False
+            self.state.save()
+            return self.active_slot
+
+    def _set_active_slot_locked(self, slot: str) -> None:
         self.active_slot = slot
         self.state.data["active_slot"] = slot
         self.thread_id = self._slot_thread_id(slot)
-        self.force_new_next = False
-        self.state.save()
 
     def bind_thread(self, thread_id: str, slot: str | None = None) -> str:
-        if slot:
-            self.set_active_slot(slot)
-        self.thread_id = thread_id
-        self._set_slot_thread_id(self.active_slot, thread_id)
-        self.force_new_next = False
-        self._save_thread_id()
-        return self.active_slot
+        with self.state_lock:
+            target_slot = normalize_slot(slot) if slot else self.active_slot
+        thread = self.lookup_thread(thread_id)
+        cwd = Path(thread.cwd).expanduser().resolve() if thread.cwd != "(unknown cwd)" else self.config.workdir
+        with self.state_lock:
+            if slot:
+                self._set_active_slot_locked(target_slot)
+            self.thread_id = thread.thread_id
+            self._set_slot_thread_id(target_slot, thread.thread_id)
+            self._set_slot_cwd(target_slot, cwd)
+            self.force_new_next = False
+            self._save_active_thread_if_needed(target_slot, thread.thread_id)
+            self.state.save()
+            return target_slot
 
     def slot_summary(self) -> str:
         slots = self._slots()
@@ -603,6 +649,7 @@ class RemoteCodexRunner:
             marker = "*" if slot == self.active_slot else "-"
             thread_id = slots[slot] or "(new on next prompt)"
             lines.append(f"{marker} {slot}: {thread_id}")
+            lines.append(f"  cwd: {self._slot_cwd(slot)}")
         return "\n".join(lines)
 
     def recent_threads_summary(self, limit: int = 10, cwd: Path | None = None) -> str:
@@ -611,6 +658,13 @@ class RemoteCodexRunner:
         except Exception as exc:  # noqa: BLE001
             return f"Could not list Codex threads: {exc}"
         return format_recent_threads_summary(result.get("data") or [], cwd)
+
+    def lookup_thread(self, thread_id: str, limit: int = 200) -> CodexThreadInfo:
+        result = self.client.request("thread/list", thread_list_params(limit), timeout=15)
+        for payload in (result or {}).get("data") or []:
+            if thread_id in {payload.get("id"), payload.get("sessionId")}:
+                return CodexThreadInfo.from_payload(payload)
+        raise BridgeError(f"Codex thread not found: {thread_id}. Use /sessions and bind one of the listed ids.")
 
     def _slots(self) -> dict[str, str | None]:
         slots = self.state.data.get("session_slots")
@@ -622,9 +676,20 @@ class RemoteCodexRunner:
             self.state.data["session_slots"] = slots
         return slots
 
+    def _slot_cwds(self) -> dict[str, str]:
+        cwds = self.state.data.get("session_slot_cwds")
+        if not isinstance(cwds, dict):
+            cwds = {}
+            self.state.data["session_slot_cwds"] = cwds
+        return cwds
+
     def _slot_thread_id(self, slot: str) -> str | None:
         value = self._slots().get(slot)
         return str(value) if value else None
+
+    def _slot_cwd(self, slot: str) -> Path:
+        value = self._slot_cwds().get(slot)
+        return Path(value).expanduser().resolve() if value else self.config.workdir
 
     def _set_slot_thread_id(self, slot: str, thread_id: str | None) -> None:
         slots = self._slots()
@@ -633,11 +698,20 @@ class RemoteCodexRunner:
         else:
             slots[slot] = None
 
+    def _set_slot_cwd(self, slot: str, cwd: Path) -> None:
+        self._slot_cwds()[slot] = str(cwd)
+
+    def _save_active_thread_if_needed(self, slot: str, thread_id: str) -> None:
+        if slot == self.active_slot:
+            self.thread_id = thread_id
+            self.state.data["codex_thread_id"] = thread_id
+            self.state.data["active_slot"] = self.active_slot
+
     def interrupt(self) -> None:
-        if self.thread_id and self.active_turn_id:
+        if self.active_thread_id and self.active_turn_id:
             self.client.request(
                 "turn/interrupt",
-                {"threadId": self.thread_id, "turnId": self.active_turn_id},
+                {"threadId": self.active_thread_id, "turnId": self.active_turn_id},
                 timeout=15,
             )
 
@@ -763,36 +837,38 @@ class RemoteCodexRunner:
                 )
             finally:
                 self.active_turn_id = None
+                self.active_thread_id = None
                 self.active_chat_id = None
                 self.jobs.task_done()
 
-    def ensure_thread(self, force_new: bool = False) -> str:
-        self.thread_id = self._slot_thread_id(self.active_slot)
-        if not force_new and not self.force_new_next and self.thread_id:
+    def ensure_thread(self, job: RemoteCodexJob) -> str:
+        if not job.force_new and job.thread_id:
             try:
-                result = self.client.request("thread/resume", self._thread_resume_params(self.thread_id))
-                self.thread_id = result["thread"]["id"]
-                self._save_thread_id()
-                return self.thread_id
+                result = self.client.request("thread/resume", self._thread_resume_params(job.thread_id, job.cwd))
+                thread_id = result["thread"]["id"]
+                self._save_slot_thread(job.slot, thread_id, job.cwd)
+                return thread_id
             except BridgeError as exc:
-                log(f"Could not resume Codex thread {self.thread_id}: {exc}; starting a new thread")
+                raise BridgeError(
+                    f"Could not resume Codex thread {job.thread_id} for slot `{job.slot}`: {exc}. "
+                    "Use /sessions and /bind to repair the slot, or /new to start a fresh thread."
+                ) from exc
 
-        result = self.client.request("thread/start", self._thread_start_params())
-        self.thread_id = result["thread"]["id"]
-        self.force_new_next = False
-        self._save_thread_id()
-        return self.thread_id
+        result = self.client.request("thread/start", self._thread_start_params(job.cwd))
+        thread_id = result["thread"]["id"]
+        self._save_slot_thread(job.slot, thread_id, job.cwd)
+        return thread_id
 
-    def _save_thread_id(self) -> None:
-        if self.thread_id:
-            self._set_slot_thread_id(self.active_slot, self.thread_id)
-            self.state.data["codex_thread_id"] = self.thread_id
-            self.state.data["active_slot"] = self.active_slot
+    def _save_slot_thread(self, slot: str, thread_id: str, cwd: Path) -> None:
+        with self.state_lock:
+            self._set_slot_thread_id(slot, thread_id)
+            self._set_slot_cwd(slot, cwd)
+            self._save_active_thread_if_needed(slot, thread_id)
             self.state.save()
 
-    def _thread_start_params(self) -> dict[str, Any]:
+    def _thread_start_params(self, cwd: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "cwd": str(self.config.workdir),
+            "cwd": str(cwd),
             "approvalPolicy": self.config.approval_policy,
             "sandbox": self.config.sandbox,
             "experimentalRawEvents": False,
@@ -804,10 +880,10 @@ class RemoteCodexRunner:
             params["modelProvider"] = self.config.model_provider
         return params
 
-    def _thread_resume_params(self, thread_id: str) -> dict[str, Any]:
+    def _thread_resume_params(self, thread_id: str, cwd: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "cwd": str(self.config.workdir),
+            "cwd": str(cwd),
             "approvalPolicy": self.config.approval_policy,
             "sandbox": self.config.sandbox,
             "persistExtendedHistory": True,
@@ -819,9 +895,10 @@ class RemoteCodexRunner:
         return params
 
     def run_turn(self, job: RemoteCodexJob) -> CodexTurnResult:
-        thread_id = self.ensure_thread(force_new=job.force_new)
+        thread_id = self.ensure_thread(job)
         input_items = build_user_input(job.prompt, job.image_paths)
         self.active_chat_id = job.chat_id
+        self.active_thread_id = thread_id
         self.telegram.send_chat_action(job.chat_id)
         result = self.client.request(
             "turn/start",
@@ -991,21 +1068,19 @@ class TelegramRemoteCodexBridge:
             self.telegram.send_message(chat_id, "Send text, a photo, or a document to forward it to Codex.")
             return
         image_paths = [item.path for item in attachments if is_image_path(item.path, item.mime_type)]
-        queue_position = self.runner.enqueue(
-            RemoteCodexJob(
-                chat_id=chat_id,
-                message_id=int(message["message_id"]),
-                prompt=prompt,
-                image_paths=image_paths,
-                force_new=self.runner.force_new_next,
-            )
+        job = self.runner.build_job_snapshot(
+            chat_id=chat_id,
+            message_id=int(message["message_id"]),
+            prompt=prompt,
+            image_paths=image_paths,
         )
+        queue_position = self.runner.enqueue(job)
         if queue_position > 1:
             self.telegram.send_message(chat_id, f"Queued for Codex. Queue position: {queue_position}.")
         else:
             self.telegram.send_message(
                 chat_id,
-                f"Received. Running Codex in slot `{self.runner.active_slot}`.",
+                f"Received. Running Codex in slot `{job.slot}`.",
                 int(message["message_id"]),
                 reply_markup=main_keyboard(),
             )
@@ -1040,10 +1115,10 @@ class TelegramRemoteCodexBridge:
             if arg.strip():
                 self.handle_use(chat_id, message_id, arg)
                 return True
-            self.runner.force_new_next = False
+            active_slot = self.runner.resume_active_next()
             self.send_main(
                 chat_id,
-                f"Next prompt will use slot `{self.runner.active_slot}`.",
+                f"Next prompt will use slot `{active_slot}`.",
                 message_id,
             )
             return True
@@ -1073,7 +1148,13 @@ class TelegramRemoteCodexBridge:
         if command == "/where":
             self.send_main(
                 chat_id,
-                f"workdir: {self.config.workdir}\nattachments: {self.config.attachments_dir}",
+                "\n".join(
+                    [
+                        f"bridge_workdir: {self.config.workdir}",
+                        f"slot_cwd: {self.runner._slot_cwd(self.runner.active_slot)}",
+                        f"attachments: {self.config.attachments_dir}",
+                    ]
+                ),
                 message_id,
             )
             return True
@@ -1099,7 +1180,7 @@ class TelegramRemoteCodexBridge:
         thread_id = self.runner.thread_id or "(new on next prompt)"
         self.send_main(
             chat_id,
-            f"Using slot `{normalized}`: {thread_id}",
+            f"Using slot `{normalized}`: {thread_id}\ncwd: {self.runner._slot_cwd(normalized)}",
             message_id,
         )
 
@@ -1110,10 +1191,14 @@ class TelegramRemoteCodexBridge:
             return
         thread_id = parts[0]
         slot = parts[1] if len(parts) > 1 else None
-        active_slot = self.runner.bind_thread(thread_id, slot)
+        try:
+            active_slot = self.runner.bind_thread(thread_id, slot)
+        except BridgeError as exc:
+            self.send_main(chat_id, f"Bind failed: {exc}", message_id)
+            return
         self.send_main(
             chat_id,
-            f"Bound slot `{active_slot}` to Codex thread {thread_id}.",
+            f"Bound slot `{active_slot}` to Codex thread {thread_id}.\ncwd: {self.runner._slot_cwd(active_slot)}",
             message_id,
         )
 
@@ -1166,7 +1251,8 @@ class TelegramRemoteCodexBridge:
                 "Telegram Codex remote bridge is running.",
                 f"active_slot: {self.runner.active_slot}",
                 f"thread_id: {self.runner.thread_id or '(none yet)'}",
-                f"workdir: {self.config.workdir}",
+                f"bridge_workdir: {self.config.workdir}",
+                f"slot_cwd: {self.runner._slot_cwd(self.runner.active_slot)}",
                 f"approval_policy: {self.config.approval_policy}",
                 f"sandbox: {self.config.sandbox}",
                 f"queued jobs: {self.runner.jobs.qsize()}",
